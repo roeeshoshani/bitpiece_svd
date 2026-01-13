@@ -1,10 +1,14 @@
-use std::path::PathBuf;
+use std::{
+    ops::{Add, Rem, Sub},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use derive_more::Display;
 use heck::{ToPascalCase, ToShoutySnakeCase, ToSnakeCase};
 use newtype_ops::newtype_ops;
+use num_traits::Zero;
 use quote::{ToTokens, quote};
 use serde::{Deserialize, Deserializer};
 use sorted_vec::SortedVec;
@@ -15,6 +19,13 @@ pub struct Cli {
 }
 
 fn mk_ident(s: &str) -> syn::Ident {
+    // make sure that it is not a keyword
+    let parsed: syn::Result<syn::Ident> = syn::parse_str(s);
+    if parsed.is_err() {
+        // it is a keyword, postfix with an underscore
+        let fixed = format!("{}_", s);
+        return syn::Ident::new(&fixed, proc_macro2::Span::call_site());
+    }
     syn::Ident::new(s, proc_macro2::Span::call_site())
 }
 
@@ -32,6 +43,15 @@ impl ToTokens for BitUnits {
         self.0.to_tokens(tokens);
     }
 }
+impl Zero for BitUnits {
+    fn zero() -> Self {
+        Self(0)
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Display)]
 pub struct ByteUnits(pub u64);
@@ -44,6 +64,15 @@ newtype_ops! { [ByteUnits] {add sub mul div rem} {:=} {^&}Self {^&}Self }
 impl ToTokens for ByteUnits {
     fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
         self.0.to_tokens(tokens);
+    }
+}
+impl Zero for ByteUnits {
+    fn zero() -> Self {
+        Self(0)
+    }
+
+    fn is_zero(&self) -> bool {
+        self.0 == 0
     }
 }
 
@@ -187,6 +216,18 @@ impl PaddingFieldIdentGenerator {
     }
 }
 
+fn align_up<T: Add<Output = T> + Rem<Output = T> + Sub<Output = T> + Zero + PartialEq + Copy>(
+    value: T,
+    alignment: T,
+) -> T {
+    let offset = value % alignment;
+    if offset == T::zero() {
+        value
+    } else {
+        value + alignment - offset
+    }
+}
+
 fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> {
     let base_addr = peripheral.base_address.0;
     let peripheral_desc = &peripheral.description;
@@ -211,13 +252,6 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
         .max()
         .unwrap_or(ByteUnits(1));
 
-    if (peripheral_size % peripheral_alignment) != ByteUnits(0) {
-        bail!(
-            "peripheral size {} is not aligned to alignment of {}",
-            peripheral_size,
-            peripheral_alignment
-        );
-    }
     if (base_addr % peripheral_alignment) != ByteUnits(0) {
         bail!(
             "peripheral base address {} is not aligned to alignment of {}",
@@ -225,6 +259,8 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
             peripheral_alignment
         );
     }
+
+    let peripheral_aligned_size = align_up(peripheral_size, peripheral_alignment);
 
     let mut struct_fields_code = quote! {};
     let mut cur_off_in_struct = ByteUnits(0);
@@ -239,17 +275,17 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
             let padding_field_ident = padding_field_ident_generator.generate();
 
             struct_fields_code.extend(quote! {
-                #padding_field_ident: [u8; #padding],
+                pub #padding_field_ident: [u8; #padding],
             });
             cur_off_in_struct += padding;
         }
 
-        let field_name = entry.reg.name.to_snake_case();
+        let field_name = mk_ident(&entry.reg.name.to_snake_case());
         let field_ty = entry.storage_ty.uint_type();
         let desc = &entry.reg.description;
         struct_fields_code.extend(quote! {
             #[doc = #desc]
-            #field_name: #field_ty,
+            pub #field_name: #field_ty,
         });
         cur_off_in_struct += entry.storage_ty.byte_len();
     }
@@ -262,7 +298,7 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
             #struct_fields_code
         }
 
-        const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #peripheral_size {
+        const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #peripheral_aligned_size {
             panic!("unexpected peripheral regs struct size");
         };
         const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #peripheral_alignment {
@@ -294,7 +330,10 @@ fn run() -> Result<()> {
             ))
         })
         .collect::<Result<proc_macro2::TokenStream>>()?;
-    println!("{}", code.to_string());
+    let file: syn::File =
+        syn::parse2(code).context("failed to parse generated code into a valid ast")?;
+    let formatted = prettyplease::unparse(&file);
+    println!("{}", formatted);
     Ok(())
 }
 
