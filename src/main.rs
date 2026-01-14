@@ -270,12 +270,14 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
 
         // add padding if needed
         if cur_off_in_struct < start_off {
+            // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
             let padding = start_off - cur_off_in_struct;
+            let padding_usize = padding.0 as usize;
 
             let padding_field_ident = padding_field_ident_generator.generate();
 
             struct_fields_code.extend(quote! {
-                pub #padding_field_ident: [u8; #padding],
+                pub #padding_field_ident: [u8; #padding_usize],
             });
             cur_off_in_struct += padding;
         }
@@ -290,6 +292,10 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
         cur_off_in_struct += entry.storage_ty.byte_len();
     }
 
+    // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
+    let aligned_size_usize = peripheral_aligned_size.0 as usize;
+    let alignment_usize = peripheral_alignment.0 as usize;
+
     Ok(quote! {
         #[doc = #peripheral_desc]
         #[repr(C)]
@@ -298,10 +304,10 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
             #struct_fields_code
         }
 
-        const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #peripheral_aligned_size {
+        const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #aligned_size_usize {
             panic!("unexpected peripheral regs struct size");
         };
-        const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #peripheral_alignment {
+        const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #alignment_usize {
             panic!("unexpected peripheral regs struct alignment");
         };
 
