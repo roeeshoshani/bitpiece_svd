@@ -259,6 +259,19 @@ fn emit_reg_field_ty(
             reg_field_ty_ident: reg_entry.storage_ty.uint_type().into_token_stream(),
         });
     }
+
+    if reg_entry.reg.fields.field.len() == 1 {
+        let field = &reg_entry.reg.fields.field[0];
+
+        // a single field which covers the entire register
+        if field.bit_offset.0 == BitUnits(0) && field.bit_width.0 == reg_entry.storage_ty.bit_len {
+            return Ok(EmittedRegFieldTy {
+                emitted_code: quote! {},
+                reg_field_ty_ident: reg_entry.storage_ty.uint_type().into_token_stream(),
+            });
+        }
+    }
+
     let mut struct_fields_code = quote! {};
     let mut cur_off_in_struct = BitUnits(0);
     let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
