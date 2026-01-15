@@ -447,6 +447,7 @@ fn run() -> Result<()> {
         })
         .collect::<Result<proc_macro2::TokenStream>>()?;
     let code = quote! {
+        #![no_std]
         use bitpiece::*;
         #peripherals_code
     };
