@@ -335,97 +335,110 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
     let base_addr = peripheral.base_address.0;
     let peripheral_desc = &peripheral.description;
 
-    let peripheral_regs_type_ident =
-        mk_ident(&format!("{}Regs", peripheral.name.to_pascal_case()))?;
     let peripheral_regs_const_ident =
         mk_ident(&format!("{}_REGS", peripheral.name.to_shouty_snake_case()))?;
 
-    let regs_mem_map = RegsMemMap::from_regs(&peripheral.registers.register)?;
+    let (regs_type_ident, extra_code) = match &peripheral.derived_from {
+        Some(derived_from) => (
+            mk_ident(&format!("{}Regs", derived_from.to_pascal_case()))?,
+            quote! {},
+        ),
+        None => {
+            let peripheral_regs_type_ident =
+                mk_ident(&format!("{}Regs", peripheral.name.to_pascal_case()))?;
 
-    let peripheral_size = regs_mem_map
-        .entries
-        .iter()
-        .map(|entry| entry.addr_range.end())
-        .max()
-        .unwrap_or(ByteUnits(0));
+            let regs_mem_map = RegsMemMap::from_regs(&peripheral.registers.register)?;
 
-    let peripheral_alignment = regs_mem_map
-        .entries
-        .iter()
-        .map(|entry| entry.storage_ty.alignment())
-        .max()
-        .unwrap_or(ByteUnits(1));
+            let peripheral_size = regs_mem_map
+                .entries
+                .iter()
+                .map(|entry| entry.addr_range.end())
+                .max()
+                .unwrap_or(ByteUnits(0));
 
-    if (base_addr % peripheral_alignment) != ByteUnits(0) {
-        bail!(
-            "peripheral base address {} is not aligned to alignment of {}",
-            base_addr,
-            peripheral_alignment
-        );
-    }
+            let peripheral_alignment = regs_mem_map
+                .entries
+                .iter()
+                .map(|entry| entry.storage_ty.alignment())
+                .max()
+                .unwrap_or(ByteUnits(1));
 
-    let peripheral_aligned_size = align_up(peripheral_size, peripheral_alignment);
+            if (base_addr % peripheral_alignment) != ByteUnits(0) {
+                bail!(
+                    "peripheral base address {} is not aligned to alignment of {}",
+                    base_addr,
+                    peripheral_alignment
+                );
+            }
 
-    let mut struct_fields_code = quote! {};
-    let mut reg_field_types_code = quote! {};
-    let mut cur_off_in_struct = ByteUnits(0);
-    let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
-    for entry in &regs_mem_map.entries {
-        let start_off = entry.addr_range.off;
+            let peripheral_aligned_size = align_up(peripheral_size, peripheral_alignment);
 
-        // add padding if needed
-        if cur_off_in_struct < start_off {
+            let mut struct_fields_code = quote! {};
+            let mut reg_field_types_code = quote! {};
+            let mut cur_off_in_struct = ByteUnits(0);
+            let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
+            for entry in &regs_mem_map.entries {
+                let start_off = entry.addr_range.off;
+
+                // add padding if needed
+                if cur_off_in_struct < start_off {
+                    // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
+                    let padding = start_off - cur_off_in_struct;
+                    let padding_usize = padding.0 as usize;
+
+                    let padding_field_ident = padding_field_ident_generator.generate();
+
+                    struct_fields_code.extend(quote! {
+                        pub #padding_field_ident: [u8; #padding_usize],
+                    });
+                    cur_off_in_struct += padding;
+                }
+
+                let field_name = mk_ident(&entry.reg.name.to_snake_case())?;
+                let emitted_reg_field_ty = emit_reg_field_ty(peripheral, entry)?;
+                reg_field_types_code.extend(emitted_reg_field_ty.emitted_code);
+
+                let field_ty = &emitted_reg_field_ty.reg_field_ty_ident;
+                let desc = &entry.reg.description;
+                struct_fields_code.extend(quote! {
+                    #[doc = #desc]
+                    pub #field_name: #field_ty,
+                });
+                cur_off_in_struct += entry.storage_ty.byte_len();
+            }
+
             // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
-            let padding = start_off - cur_off_in_struct;
-            let padding_usize = padding.0 as usize;
+            let aligned_size_usize = peripheral_aligned_size.0 as usize;
+            let alignment_usize = peripheral_alignment.0 as usize;
+            let code = quote! {
+                #reg_field_types_code
 
-            let padding_field_ident = padding_field_ident_generator.generate();
+                #[doc = #peripheral_desc]
+                #[repr(C)]
+                #[derive(Debug, Clone, ::volatile::VolatileFieldAccess)]
+                pub struct #peripheral_regs_type_ident {
+                    #struct_fields_code
+                }
 
-            struct_fields_code.extend(quote! {
-                pub #padding_field_ident: [u8; #padding_usize],
-            });
-            cur_off_in_struct += padding;
+                const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #aligned_size_usize {
+                    panic!("unexpected peripheral regs struct size");
+                };
+                const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #alignment_usize {
+                    panic!("unexpected peripheral regs struct alignment");
+                };
+            };
+            (peripheral_regs_type_ident, code)
         }
-
-        let field_name = mk_ident(&entry.reg.name.to_snake_case())?;
-        let emitted_reg_field_ty = emit_reg_field_ty(peripheral, entry)?;
-        reg_field_types_code.extend(emitted_reg_field_ty.emitted_code);
-
-        let field_ty = &emitted_reg_field_ty.reg_field_ty_ident;
-        let desc = &entry.reg.description;
-        struct_fields_code.extend(quote! {
-            #[doc = #desc]
-            pub #field_name: #field_ty,
-        });
-        cur_off_in_struct += entry.storage_ty.byte_len();
-    }
-
-    // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
-    let aligned_size_usize = peripheral_aligned_size.0 as usize;
-    let alignment_usize = peripheral_alignment.0 as usize;
+    };
 
     Ok(quote! {
-        #reg_field_types_code
+        #extra_code
 
         #[doc = #peripheral_desc]
-        #[repr(C)]
-        #[derive(Debug, Clone, ::volatile::VolatileFieldAccess)]
-        pub struct #peripheral_regs_type_ident {
-            #struct_fields_code
-        }
-
-        const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #aligned_size_usize {
-            panic!("unexpected peripheral regs struct size");
-        };
-        const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #alignment_usize {
-            panic!("unexpected peripheral regs struct alignment");
-        };
-
-        #[doc = #peripheral_desc]
-        pub const #peripheral_regs_const_ident: ::volatile::VolatilePtr<'static, #peripheral_regs_type_ident> = unsafe {
+        pub const #peripheral_regs_const_ident: ::volatile::VolatilePtr<'static, #regs_type_ident> = unsafe {
             ::volatile::VolatilePtr::new_restricted(
                 ::volatile::access::ReadWrite,
-                ::core::ptr::NonNull::new(#base_addr as *mut #peripheral_regs_type_ident).unwrap(),
+                ::core::ptr::NonNull::new(#base_addr as *mut #regs_type_ident).unwrap(),
             )
         };
     })
@@ -529,6 +542,8 @@ pub struct Peripheral {
     pub base_address: SvdNumByteUnits,
     #[serde(default)]
     pub registers: Regs,
+    #[serde(rename = "@derivedFrom")]
+    pub derived_from: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
