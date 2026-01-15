@@ -18,15 +18,24 @@ pub struct Cli {
     pub svd_file: PathBuf,
 }
 
-fn mk_ident(s: &str) -> syn::Ident {
+fn mk_ident(s: &str) -> Result<syn::Ident> {
+    if s.is_empty() {
+        bail!("can't create an empty ident");
+    }
+
+    let s = if s.chars().next().unwrap().is_ascii_digit() {
+        format!("f_{}", s)
+    } else {
+        s.to_owned()
+    };
     // make sure that it is not a keyword
-    let parsed: syn::Result<syn::Ident> = syn::parse_str(s);
+    let parsed: syn::Result<syn::Ident> = syn::parse_str(&s);
     if parsed.is_err() {
         // it is a keyword, postfix with an underscore
         let fixed = format!("{}_", s);
-        return syn::Ident::new(&fixed, proc_macro2::Span::call_site());
+        return Ok(syn::Ident::new(&fixed, proc_macro2::Span::call_site()));
     }
-    syn::Ident::new(s, proc_macro2::Span::call_site())
+    Ok(syn::Ident::new(&s, proc_macro2::Span::call_site()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Display)]
@@ -210,9 +219,9 @@ impl PaddingFieldIdentGenerator {
         Self { cur_field_index: 0 }
     }
     pub fn generate(&mut self) -> syn::Ident {
-        let res = mk_ident(&format!("___padding{}", self.cur_field_index));
+        let res = mk_ident(&format!("svd_padding_{}", self.cur_field_index));
         self.cur_field_index += 1;
-        res
+        res.unwrap()
     }
 }
 
@@ -228,13 +237,85 @@ fn align_up<T: Add<Output = T> + Rem<Output = T> + Sub<Output = T> + Zero + Part
     }
 }
 
+fn mk_b_type(bit_len: BitUnits) -> Result<syn::Ident> {
+    if bit_len.0 < 1 || bit_len.0 > 64 {
+        bail!("invalid bit length {} for bit field", bit_len);
+    }
+    mk_ident(&format!("B{}", bit_len))
+}
+
+struct EmittedRegFieldTy {
+    emitted_code: proc_macro2::TokenStream,
+    reg_field_ty_ident: proc_macro2::TokenStream,
+}
+
+fn emit_reg_field_ty(
+    peripheral: &Peripheral,
+    reg_entry: &RegMemMapEntry,
+) -> Result<EmittedRegFieldTy> {
+    if reg_entry.reg.fields.field.is_empty() {
+        return Ok(EmittedRegFieldTy {
+            emitted_code: quote! {},
+            reg_field_ty_ident: reg_entry.storage_ty.uint_type().into_token_stream(),
+        });
+    }
+    let mut struct_fields_code = quote! {};
+    let mut cur_off_in_struct = BitUnits(0);
+    let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
+    let sorted_fields = {
+        let mut fields = reg_entry.reg.fields.field.clone();
+        fields.sort_unstable_by_key(|field| field.bit_offset);
+        fields
+    };
+    for field in &sorted_fields {
+        let start_off = field.bit_offset.0;
+
+        // add padding if needed
+        if cur_off_in_struct < start_off {
+            let padding_bits = start_off - cur_off_in_struct;
+            let padding_field_ident = padding_field_ident_generator.generate();
+            let padding_field_ty = mk_b_type(padding_bits)?;
+            struct_fields_code.extend(quote! {
+                pub #padding_field_ident: #padding_field_ty,
+            });
+            cur_off_in_struct += padding_bits;
+        }
+
+        let field_name = mk_ident(&field.name.to_snake_case())?;
+        let field_ty = mk_b_type(field.bit_width.0)?;
+        let desc = &field.description;
+        struct_fields_code.extend(quote! {
+            #[doc = #desc]
+            pub #field_name: #field_ty,
+        });
+        cur_off_in_struct += field.bit_width.0;
+    }
+
+    let reg_struct_ident = mk_ident(&format!(
+        "{}{}Reg",
+        peripheral.name.to_pascal_case(),
+        reg_entry.reg.name.to_pascal_case()
+    ))?;
+
+    Ok(EmittedRegFieldTy {
+        emitted_code: quote! {
+            #[bitpiece]
+            pub struct #reg_struct_ident {
+                #struct_fields_code
+            }
+        },
+        reg_field_ty_ident: reg_struct_ident.into_token_stream(),
+    })
+}
+
 fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> {
     let base_addr = peripheral.base_address.0;
     let peripheral_desc = &peripheral.description;
 
-    let peripheral_regs_type_ident = mk_ident(&format!("{}Regs", peripheral.name.to_pascal_case()));
+    let peripheral_regs_type_ident =
+        mk_ident(&format!("{}Regs", peripheral.name.to_pascal_case()))?;
     let peripheral_regs_const_ident =
-        mk_ident(&format!("{}_REGS", peripheral.name.to_shouty_snake_case()));
+        mk_ident(&format!("{}_REGS", peripheral.name.to_shouty_snake_case()))?;
 
     let regs_mem_map = RegsMemMap::from_regs(&peripheral.registers.register)?;
 
@@ -263,6 +344,7 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
     let peripheral_aligned_size = align_up(peripheral_size, peripheral_alignment);
 
     let mut struct_fields_code = quote! {};
+    let mut reg_field_types_code = quote! {};
     let mut cur_off_in_struct = ByteUnits(0);
     let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
     for entry in &regs_mem_map.entries {
@@ -282,8 +364,11 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
             cur_off_in_struct += padding;
         }
 
-        let field_name = mk_ident(&entry.reg.name.to_snake_case());
-        let field_ty = entry.storage_ty.uint_type();
+        let field_name = mk_ident(&entry.reg.name.to_snake_case())?;
+        let emitted_reg_field_ty = emit_reg_field_ty(peripheral, entry)?;
+        reg_field_types_code.extend(emitted_reg_field_ty.emitted_code);
+
+        let field_ty = &emitted_reg_field_ty.reg_field_ty_ident;
         let desc = &entry.reg.description;
         struct_fields_code.extend(quote! {
             #[doc = #desc]
@@ -297,6 +382,8 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
     let alignment_usize = peripheral_alignment.0 as usize;
 
     Ok(quote! {
+        #reg_field_types_code
+
         #[doc = #peripheral_desc]
         #[repr(C)]
         #[derive(Debug, Clone, ::volatile::VolatileFieldAccess)]
@@ -325,7 +412,7 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let svd = std::fs::read_to_string(cli.svd_file).context("failed to read input svd file")?;
     let device: Device = quick_xml::de::from_str(&svd).context("failed to parse svd file")?;
-    let code = device
+    let peripherals_code = device
         .peripherals
         .peripheral
         .iter()
@@ -336,6 +423,10 @@ fn run() -> Result<()> {
             ))
         })
         .collect::<Result<proc_macro2::TokenStream>>()?;
+    let code = quote! {
+        use bitpiece::*;
+        #peripherals_code
+    };
     let file: syn::File =
         syn::parse2(code).context("failed to parse generated code into a valid ast")?;
     let formatted = prettyplease::unparse(&file);
@@ -439,7 +530,7 @@ pub struct RegFields {
     pub field: Vec<RegField>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RegField {
     pub name: String,
