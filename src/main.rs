@@ -304,6 +304,15 @@ fn emit_reg_field_ty(
         cur_off_in_struct += field.bit_width.0;
     }
 
+    let padding_bits = reg_entry.storage_ty.bit_len - cur_off_in_struct;
+    if padding_bits != BitUnits(0) {
+        let padding_field_ident = padding_field_ident_generator.generate();
+        let padding_field_ty = mk_b_type(padding_bits)?;
+        struct_fields_code.extend(quote! {
+            pub #padding_field_ident: #padding_field_ty,
+        });
+    }
+
     let reg_struct_ident = mk_ident(&format!(
         "{}{}Reg",
         peripheral.name.to_pascal_case(),
