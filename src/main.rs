@@ -300,6 +300,7 @@ fn emit_reg_field_ty(
     Ok(EmittedRegFieldTy {
         emitted_code: quote! {
             #[bitpiece]
+            #[derive(Debug)]
             pub struct #reg_struct_ident {
                 #struct_fields_code
             }
