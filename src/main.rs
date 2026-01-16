@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     ops::{Add, Rem, Sub},
     path::PathBuf,
 };
@@ -36,6 +37,10 @@ fn mk_ident(s: &str) -> Result<syn::Ident> {
         return Ok(syn::Ident::new(&fixed, proc_macro2::Span::call_site()));
     }
     Ok(syn::Ident::new(&s, proc_macro2::Span::call_site()))
+}
+
+fn mk_peripheral_regs_struct_ident(peripheral_name: &str) -> Result<syn::Ident> {
+    mk_ident(&format!("{}Regs", peripheral_name.to_pascal_case()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Display)]
@@ -331,134 +336,12 @@ fn emit_reg_field_ty(
     })
 }
 
-fn emit_peripheral(peripheral: &SvdPeripheral) -> Result<proc_macro2::TokenStream> {
-    let base_addr = peripheral.base_address.0;
-    let peripheral_desc = &peripheral.description;
-
-    let peripheral_regs_const_ident =
-        mk_ident(&format!("{}_REGS", peripheral.name.to_shouty_snake_case()))?;
-
-    let (regs_type_ident, extra_code) = match &peripheral.derived_from {
-        Some(derived_from) => (
-            mk_ident(&format!("{}Regs", derived_from.to_pascal_case()))?,
-            quote! {},
-        ),
-        None => {
-            let peripheral_regs_type_ident =
-                mk_ident(&format!("{}Regs", peripheral.name.to_pascal_case()))?;
-
-            let regs_mem_map = RegsMemMap::from_regs(&peripheral.registers.register)?;
-
-            let peripheral_size = regs_mem_map
-                .entries
-                .iter()
-                .map(|entry| entry.addr_range.end())
-                .max()
-                .unwrap_or(ByteUnits(0));
-
-            let peripheral_alignment = regs_mem_map
-                .entries
-                .iter()
-                .map(|entry| entry.storage_ty.alignment())
-                .max()
-                .unwrap_or(ByteUnits(1));
-
-            if (base_addr % peripheral_alignment) != ByteUnits(0) {
-                bail!(
-                    "peripheral base address {} is not aligned to alignment of {}",
-                    base_addr,
-                    peripheral_alignment
-                );
-            }
-
-            let peripheral_aligned_size = align_up(peripheral_size, peripheral_alignment);
-
-            let mut struct_fields_code = quote! {};
-            let mut reg_field_types_code = quote! {};
-            let mut cur_off_in_struct = ByteUnits(0);
-            let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
-            for entry in &regs_mem_map.entries {
-                let start_off = entry.addr_range.off;
-
-                // add padding if needed
-                if cur_off_in_struct < start_off {
-                    // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
-                    let padding = start_off - cur_off_in_struct;
-                    let padding_usize = padding.0 as usize;
-
-                    let padding_field_ident = padding_field_ident_generator.generate();
-
-                    struct_fields_code.extend(quote! {
-                        pub #padding_field_ident: [u8; #padding_usize],
-                    });
-                    cur_off_in_struct += padding;
-                }
-
-                let field_name = mk_ident(&entry.reg.name.to_snake_case())?;
-                let emitted_reg_field_ty = emit_reg_field_ty(peripheral, entry)?;
-                reg_field_types_code.extend(emitted_reg_field_ty.emitted_code);
-
-                let field_ty = &emitted_reg_field_ty.reg_field_ty_ident;
-                let desc = &entry.reg.description;
-                struct_fields_code.extend(quote! {
-                    #[doc = #desc]
-                    pub #field_name: #field_ty,
-                });
-                cur_off_in_struct += entry.storage_ty.byte_len();
-            }
-
-            // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
-            let aligned_size_usize = peripheral_aligned_size.0 as usize;
-            let alignment_usize = peripheral_alignment.0 as usize;
-            let code = quote! {
-                #reg_field_types_code
-
-                #[doc = #peripheral_desc]
-                #[repr(C)]
-                #[derive(Debug, Clone, ::volatile::VolatileFieldAccess)]
-                pub struct #peripheral_regs_type_ident {
-                    #struct_fields_code
-                }
-
-                const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #aligned_size_usize {
-                    panic!("unexpected peripheral regs struct size");
-                };
-                const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #alignment_usize {
-                    panic!("unexpected peripheral regs struct alignment");
-                };
-            };
-            (peripheral_regs_type_ident, code)
-        }
-    };
-
-    Ok(quote! {
-        #extra_code
-
-        #[doc = #peripheral_desc]
-        pub const #peripheral_regs_const_ident: ::volatile::VolatilePtr<'static, #regs_type_ident> = unsafe {
-            ::volatile::VolatilePtr::new_restricted(
-                ::volatile::access::ReadWrite,
-                ::core::ptr::NonNull::new(#base_addr as *mut #regs_type_ident).unwrap(),
-            )
-        };
-    })
-}
-
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let svd = std::fs::read_to_string(cli.svd_file).context("failed to read input svd file")?;
     let device: SvdDevice = quick_xml::de::from_str(&svd).context("failed to parse svd file")?;
-    let peripherals_code = device
-        .peripherals
-        .peripheral
-        .iter()
-        .map(|peripheral| {
-            emit_peripheral(peripheral).context(format!(
-                "failed to emit code for peripheral {}",
-                peripheral.name
-            ))
-        })
-        .collect::<Result<proc_macro2::TokenStream>>()?;
+    let peripherals = Peripherals::from_svd(&device.peripherals);
+    let peripherals_code = peripherals.emit_all()?;
     let code = quote! {
         #![no_std]
         use bitpiece::*;
@@ -474,6 +357,150 @@ fn run() -> Result<()> {
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {:#}", err)
+    }
+}
+
+struct Peripherals(HashMap<String, SvdPeripheral>);
+impl Peripherals {
+    fn from_svd(svd_peripherals: &SvdPeripherals) -> Self {
+        Self(
+            svd_peripherals
+                .peripheral
+                .iter()
+                .cloned()
+                .map(|x| (x.name.clone(), x))
+                .collect(),
+        )
+    }
+    fn find_root_name<'a>(&'a self, peripheral_name: &'a str) -> &'a str {
+        let mut cur_name = peripheral_name;
+        loop {
+            let cur_peripheral = &self.0[peripheral_name];
+            match &cur_peripheral.derived_from {
+                Some(parent) => cur_name = parent,
+                None => return cur_name,
+            }
+        }
+    }
+
+    fn emit_one(&self, peripheral_name: &str) -> Result<proc_macro2::TokenStream> {
+        let peripheral = &self.0[peripheral_name];
+        let base_addr = peripheral.base_address.0;
+        let peripheral_desc = &peripheral.description;
+
+        let peripheral_regs_const_ident =
+            mk_ident(&format!("{}_REGS", peripheral.name.to_shouty_snake_case()))?;
+
+        let (regs_type_ident, extra_code) = match &peripheral.derived_from {
+            Some(derived_from) => {
+                let root_peripheral_name = self.find_root_name(derived_from);
+                (
+                    mk_peripheral_regs_struct_ident(root_peripheral_name)?,
+                    quote! {},
+                )
+            }
+            None => {
+                let peripheral_regs_type_ident = mk_peripheral_regs_struct_ident(&peripheral.name)?;
+
+                let regs_mem_map = RegsMemMap::from_regs(&peripheral.registers.register)?;
+
+                let peripheral_size = regs_mem_map
+                    .entries
+                    .iter()
+                    .map(|entry| entry.addr_range.end())
+                    .max()
+                    .unwrap_or(ByteUnits(0));
+
+                let peripheral_alignment = regs_mem_map
+                    .entries
+                    .iter()
+                    .map(|entry| entry.storage_ty.alignment())
+                    .max()
+                    .unwrap_or(ByteUnits(1));
+
+                if (base_addr % peripheral_alignment) != ByteUnits(0) {
+                    bail!(
+                        "peripheral base address {} is not aligned to alignment of {}",
+                        base_addr,
+                        peripheral_alignment
+                    );
+                }
+
+                let peripheral_aligned_size = align_up(peripheral_size, peripheral_alignment);
+
+                let mut struct_fields_code = quote! {};
+                let mut reg_field_types_code = quote! {};
+                let mut cur_off_in_struct = ByteUnits(0);
+                let mut padding_field_ident_generator = PaddingFieldIdentGenerator::new();
+                for entry in &regs_mem_map.entries {
+                    let start_off = entry.addr_range.off;
+
+                    // add padding if needed
+                    if cur_off_in_struct < start_off {
+                        // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
+                        let padding = start_off - cur_off_in_struct;
+                        let padding_usize = padding.0 as usize;
+
+                        let padding_field_ident = padding_field_ident_generator.generate();
+
+                        struct_fields_code.extend(quote! {
+                            pub #padding_field_ident: [u8; #padding_usize],
+                        });
+                        cur_off_in_struct += padding;
+                    }
+
+                    let field_name = mk_ident(&entry.reg.name.to_snake_case())?;
+                    let emitted_reg_field_ty = emit_reg_field_ty(peripheral, entry)?;
+                    reg_field_types_code.extend(emitted_reg_field_ty.emitted_code);
+
+                    let field_ty = &emitted_reg_field_ty.reg_field_ty_ident;
+                    let desc = &entry.reg.description;
+                    struct_fields_code.extend(quote! {
+                        #[doc = #desc]
+                        pub #field_name: #field_ty,
+                    });
+                    cur_off_in_struct += entry.storage_ty.byte_len();
+                }
+
+                // NOTE: must cast to `usize` here, otherwise it emits the integer literal with a u64 postfix (e.g `3u64`).
+                let aligned_size_usize = peripheral_aligned_size.0 as usize;
+                let alignment_usize = peripheral_alignment.0 as usize;
+                let code = quote! {
+                    #reg_field_types_code
+
+                    #[doc = #peripheral_desc]
+                    #[repr(C)]
+                    #[derive(Debug, Clone, ::volatile::VolatileFieldAccess)]
+                    pub struct #peripheral_regs_type_ident {
+                        #struct_fields_code
+                    }
+
+                    const _: () = if ::core::mem::size_of::<#peripheral_regs_type_ident>() != #aligned_size_usize {
+                        panic!("unexpected peripheral regs struct size");
+                    };
+                    const _: () = if ::core::mem::align_of::<#peripheral_regs_type_ident>() != #alignment_usize {
+                        panic!("unexpected peripheral regs struct alignment");
+                    };
+                };
+                (peripheral_regs_type_ident, code)
+            }
+        };
+
+        Ok(quote! {
+            #extra_code
+
+            #[doc = #peripheral_desc]
+            pub const #peripheral_regs_const_ident: ::volatile::VolatilePtr<'static, #regs_type_ident> = unsafe {
+                ::volatile::VolatilePtr::new_restricted(
+                    ::volatile::access::ReadWrite,
+                    ::core::ptr::NonNull::new(#base_addr as *mut #regs_type_ident).unwrap(),
+                )
+            };
+        })
+    }
+
+    fn emit_all(&self) -> Result<proc_macro2::TokenStream> {
+        self.0.keys().map(|name| self.emit_one(name)).collect()
     }
 }
 
@@ -534,7 +561,7 @@ pub struct SvdPeripherals {
     pub peripheral: Vec<SvdPeripheral>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SvdPeripheral {
     pub name: String,
@@ -546,13 +573,13 @@ pub struct SvdPeripheral {
     pub derived_from: Option<String>,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SvdRegs {
     pub register: Vec<SvdReg>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SvdReg {
     pub name: String,
@@ -563,7 +590,7 @@ pub struct SvdReg {
     pub fields: SvdRegFields,
 }
 
-#[derive(Deserialize, Debug, Default)]
+#[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SvdRegFields {
     pub field: Vec<SvdRegField>,
