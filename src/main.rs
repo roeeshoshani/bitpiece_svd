@@ -17,6 +17,7 @@ use sorted_vec::SortedVec;
 #[derive(clap::Parser)]
 pub struct Cli {
     pub svd_file: PathBuf,
+    pub out_dir: PathBuf,
 }
 
 fn mk_ident(s: &str) -> Result<syn::Ident> {
@@ -41,6 +42,23 @@ fn mk_ident(s: &str) -> Result<syn::Ident> {
 
 fn mk_peripheral_regs_struct_ident(peripheral_name: &str) -> Result<syn::Ident> {
     mk_ident(&format!("{}Regs", peripheral_name.to_pascal_case()))
+}
+
+fn mk_peripheral_mod_name(peripheral_name: &str) -> String {
+    peripheral_name.to_snake_case()
+}
+
+fn mk_peripheral_mod_file_name(peripheral_name: &str) -> String {
+    let mod_name = mk_peripheral_mod_name(peripheral_name);
+
+    // avoid collision with the lib.rs file
+    let mod_name = if mod_name == "lib" { "lib_" } else { &mod_name };
+
+    format!("{}.rs", mod_name)
+}
+
+fn mk_peripheral_mod_ident(peripheral_name: &str) -> Result<syn::Ident> {
+    mk_ident(&mk_peripheral_mod_name(peripheral_name))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Display)]
@@ -335,22 +353,78 @@ fn emit_reg_field_ty(
         reg_field_ty_ident: reg_struct_ident.into_token_stream(),
     })
 }
+struct PeripheralGeneratedMod {
+    mod_ident: syn::Ident,
+    mod_file_path: PathBuf,
+    mod_file_code: syn::File,
+}
+
+struct GeneratedFile {
+    path: PathBuf,
+    code: syn::File,
+}
+
+fn write_generated_files<I: Iterator<Item = GeneratedFile>>(files: I) -> Result<()> {
+    for file in files {
+        let formatted_code = prettyplease::unparse(&file.code);
+        std::fs::write(&file.path, formatted_code)
+            .context(format!("failed to write to file {}", file.path.display()))?;
+    }
+    Ok(())
+}
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let svd = std::fs::read_to_string(cli.svd_file).context("failed to read input svd file")?;
     let device: SvdDevice = quick_xml::de::from_str(&svd).context("failed to parse svd file")?;
     let peripherals = Peripherals::from_svd(&device.peripherals);
-    let peripherals_code = peripherals.emit_all()?;
-    let code = quote! {
+    let peripheral_mods = peripherals
+        .names()
+        .map(|peripheral_name| {
+            let raw_code = peripherals.emit_one(peripheral_name)?;
+            let mod_file_code = syn::parse2(raw_code).context(format!(
+                "failed to parse generated code of peripheral {} into a valid ast",
+                peripheral_name
+            ))?;
+            Ok(PeripheralGeneratedMod {
+                mod_ident: mk_peripheral_mod_ident(peripheral_name)?,
+                mod_file_path: cli
+                    .out_dir
+                    .join(mk_peripheral_mod_file_name(peripheral_name)),
+                mod_file_code,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mod_declarations = peripheral_mods.iter().map(|peripheral_mod| {
+        let ident = &peripheral_mod.mod_ident;
+        quote! {
+            pub mod #ident;
+        }
+    });
+
+    let lib_rs_code = quote! {
         #![no_std]
-        use bitpiece::*;
-        #peripherals_code
+        #(#mod_declarations)*
     };
-    let file: syn::File =
-        syn::parse2(code).context("failed to parse generated code into a valid ast")?;
-    let formatted = prettyplease::unparse(&file);
-    println!("{}", formatted);
+    let lib_rs_file: syn::File =
+        syn::parse2(lib_rs_code).context("failed to parse generated code into a valid ast")?;
+
+    let generated_files = std::iter::once(GeneratedFile {
+        path: cli.out_dir.join("lib.rs"),
+        code: lib_rs_file,
+    })
+    .chain(
+        peripheral_mods
+            .into_iter()
+            .map(|peripheral_mod| GeneratedFile {
+                path: peripheral_mod.mod_file_path,
+                code: peripheral_mod.mod_file_code,
+            }),
+    );
+
+    write_generated_files(generated_files)?;
+
     Ok(())
 }
 
@@ -360,19 +434,23 @@ fn main() {
     }
 }
 
-struct Peripherals(HashMap<String, SvdPeripheral>);
-impl Peripherals {
-    fn from_svd(svd_peripherals: &SvdPeripherals) -> Self {
+struct Peripherals<'a>(HashMap<&'a str, &'a SvdPeripheral>);
+impl<'a> Peripherals<'a> {
+    fn from_svd(svd_peripherals: &'a SvdPeripherals) -> Self {
         Self(
             svd_peripherals
                 .peripheral
                 .iter()
-                .cloned()
-                .map(|x| (x.name.clone(), x))
+                .map(|x| (x.name.as_str(), x))
                 .collect(),
         )
     }
-    fn find_root_name<'a>(&'a self, peripheral_name: &'a str) -> &'a str {
+
+    fn names(&self) -> impl Iterator<Item = &'a str> {
+        self.0.keys().copied()
+    }
+
+    fn find_root_name(&self, peripheral_name: &'a str) -> &'a str {
         let mut cur_name = peripheral_name;
         loop {
             let cur_peripheral = &self.0[peripheral_name];
@@ -394,10 +472,16 @@ impl Peripherals {
         let (regs_type_ident, extra_code) = match &peripheral.derived_from {
             Some(derived_from) => {
                 let root_peripheral_name = self.find_root_name(derived_from);
-                (
-                    mk_peripheral_regs_struct_ident(root_peripheral_name)?,
-                    quote! {},
-                )
+                let root_peripheral_mod_ident = mk_peripheral_mod_ident(root_peripheral_name)?;
+                let root_peripheral_regs_struct_ident =
+                    mk_peripheral_regs_struct_ident(root_peripheral_name)?;
+
+                // need to import the regs struct of the root peripheral from which we are derived.
+                let extra_code = quote! {
+                    pub use super::#root_peripheral_mod_ident::#root_peripheral_regs_struct_ident;
+                };
+
+                (root_peripheral_regs_struct_ident, extra_code)
             }
             None => {
                 let peripheral_regs_type_ident = mk_peripheral_regs_struct_ident(&peripheral.name)?;
@@ -487,6 +571,9 @@ impl Peripherals {
         };
 
         Ok(quote! {
+            #[allow(unused_imports)]
+            use bitpiece::*;
+
             #extra_code
 
             #[doc = #peripheral_desc]
@@ -497,10 +584,6 @@ impl Peripherals {
                 )
             };
         })
-    }
-
-    fn emit_all(&self) -> Result<proc_macro2::TokenStream> {
-        self.0.keys().map(|name| self.emit_one(name)).collect()
     }
 }
 
