@@ -104,7 +104,7 @@ impl RegStorageType {
     }
 }
 
-fn choose_reg_storage_type(reg: &Reg) -> Result<RegStorageType> {
+fn choose_reg_storage_type(reg: &SvdReg) -> Result<RegStorageType> {
     let bit_len = reg.size.0;
     let res = match bit_len {
         BitUnits(8) | BitUnits(16) | BitUnits(32) | BitUnits(64) => {
@@ -141,7 +141,7 @@ impl std::fmt::Display for RegAddrRange {
 }
 
 pub struct RegMemMapEntry<'a> {
-    pub reg: &'a Reg,
+    pub reg: &'a SvdReg,
     pub addr_range: RegAddrRange,
     pub storage_ty: RegStorageType,
 }
@@ -171,7 +171,7 @@ impl<'a> RegsMemMap<'a> {
             entries: SortedVec::new(),
         }
     }
-    pub fn from_regs<I: IntoIterator<Item = &'a Reg>>(regs: I) -> Result<Self> {
+    pub fn from_regs<I: IntoIterator<Item = &'a SvdReg>>(regs: I) -> Result<Self> {
         let mut res = Self::new();
         for reg in regs {
             res.add_reg(reg)
@@ -179,7 +179,7 @@ impl<'a> RegsMemMap<'a> {
         }
         Ok(res)
     }
-    pub fn add_reg(&mut self, reg: &'a Reg) -> Result<()> {
+    pub fn add_reg(&mut self, reg: &'a SvdReg) -> Result<()> {
         let storage_ty = choose_reg_storage_type(reg)?;
         let new_entry = RegMemMapEntry {
             reg,
@@ -250,7 +250,7 @@ struct EmittedRegFieldTy {
 }
 
 fn emit_reg_field_ty(
-    peripheral: &Peripheral,
+    peripheral: &SvdPeripheral,
     reg_entry: &RegMemMapEntry,
 ) -> Result<EmittedRegFieldTy> {
     if reg_entry.reg.fields.field.is_empty() {
@@ -331,7 +331,7 @@ fn emit_reg_field_ty(
     })
 }
 
-fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> {
+fn emit_peripheral(peripheral: &SvdPeripheral) -> Result<proc_macro2::TokenStream> {
     let base_addr = peripheral.base_address.0;
     let peripheral_desc = &peripheral.description;
 
@@ -447,7 +447,7 @@ fn emit_peripheral(peripheral: &Peripheral) -> Result<proc_macro2::TokenStream> 
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let svd = std::fs::read_to_string(cli.svd_file).context("failed to read input svd file")?;
-    let device: Device = quick_xml::de::from_str(&svd).context("failed to parse svd file")?;
+    let device: SvdDevice = quick_xml::de::from_str(&svd).context("failed to parse svd file")?;
     let peripherals_code = device
         .peripherals
         .peripheral
@@ -522,56 +522,56 @@ impl<'de> Deserialize<'de> for SvdNum {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Device {
-    pub peripherals: Peripherals,
+pub struct SvdDevice {
+    pub peripherals: SvdPeripherals,
     pub address_unit_bits: SvdNumBitUnits,
     pub width: SvdNumBitUnits,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Peripherals {
-    pub peripheral: Vec<Peripheral>,
+pub struct SvdPeripherals {
+    pub peripheral: Vec<SvdPeripheral>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Peripheral {
+pub struct SvdPeripheral {
     pub name: String,
     pub description: String,
     pub base_address: SvdNumByteUnits,
     #[serde(default)]
-    pub registers: Regs,
+    pub registers: SvdRegs,
     #[serde(rename = "@derivedFrom")]
     pub derived_from: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct Regs {
-    pub register: Vec<Reg>,
+pub struct SvdRegs {
+    pub register: Vec<SvdReg>,
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct Reg {
+pub struct SvdReg {
     pub name: String,
     pub description: String,
     pub address_offset: SvdNumByteUnits,
     pub size: SvdNumBitUnits,
     #[serde(default)]
-    pub fields: RegFields,
+    pub fields: SvdRegFields,
 }
 
 #[derive(Deserialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct RegFields {
-    pub field: Vec<RegField>,
+pub struct SvdRegFields {
+    pub field: Vec<SvdRegField>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct RegField {
+pub struct SvdRegField {
     pub name: String,
     pub description: String,
     pub bit_offset: SvdNumBitUnits,
