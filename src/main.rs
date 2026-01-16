@@ -570,6 +570,11 @@ impl<'a> Peripherals<'a> {
             }
         };
 
+        let base_addr_hex = syn::LitInt::new(
+            &format!("0x{:x}", base_addr.0),
+            proc_macro2::Span::call_site(),
+        );
+
         Ok(quote! {
             #[allow(unused_imports)]
             use bitpiece::*;
@@ -580,7 +585,7 @@ impl<'a> Peripherals<'a> {
             pub const #peripheral_regs_const_ident: ::volatile::VolatilePtr<'static, #regs_type_ident> = unsafe {
                 ::volatile::VolatilePtr::new_restricted(
                     ::volatile::access::ReadWrite,
-                    ::core::ptr::NonNull::new(#base_addr as *mut #regs_type_ident).unwrap(),
+                    ::core::ptr::NonNull::new(#base_addr_hex as *mut #regs_type_ident).unwrap(),
                 )
             };
         })
