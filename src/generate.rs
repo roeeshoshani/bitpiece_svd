@@ -210,15 +210,19 @@ fn gen_instance_consts(g: &GroupIr) -> TokenStream {
 
     let consts = g.instances.iter().map(|inst| {
         let cname = format_ident!("{}_REGS", inst.name);
-        let base = inst.base_address as usize;
         let doc_attr = inst.description.as_ref().map(|d| quote!(#[doc = #d]));
+
+        let base_addr_hex = syn::LitInt::new(
+            &format!("0x{:x}", inst.base_address),
+            proc_macro2::Span::call_site(),
+        );
 
         quote! {
             #doc_attr
             pub const #cname: ::volatile::VolatilePtr<'static, #regs_ty> = unsafe {
                 ::volatile::VolatilePtr::new_restricted(
                     ::volatile::access::ReadWrite,
-                    NonNull::new(#base as *mut #regs_ty).unwrap(),
+                    NonNull::new(#base_addr_hex as *mut #regs_ty).unwrap(),
                 )
             };
         }
