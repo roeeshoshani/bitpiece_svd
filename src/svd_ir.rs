@@ -4,7 +4,10 @@ use anyhow::{Result, anyhow};
 
 use svd_parser::{self, Config, svd};
 
-use crate::name::{group_key_from_peripheral, sanitize_mod_name};
+use crate::{
+    ident::ident,
+    name::{group_key_from_peripheral, sanitize_mod_name},
+};
 
 #[derive(Debug, Clone)]
 pub struct DeviceIr {
@@ -84,10 +87,7 @@ pub fn build_device_ir(dev: &svd::Device) -> Result<DeviceIr> {
 
         let items = collect_register_items_flat(def)?;
 
-        let regs_ty = syn::Ident::new(
-            &format!("{}Regs", pascal(&key)),
-            proc_macro2::Span::call_site(),
-        );
+        let regs_ty = ident(format!("{}Regs", heck::AsUpperCamelCase(&key)));
 
         let instances = ps
             .iter()
@@ -107,12 +107,6 @@ pub fn build_device_ir(dev: &svd::Device) -> Result<DeviceIr> {
     }
 
     Ok(DeviceIr { groups })
-}
-
-// -------- helpers --------
-
-fn pascal(s: &str) -> String {
-    heck::AsUpperCamelCase(s).to_string()
 }
 
 /// Flatten clusters by prefixing names: CLUSTER_REG.
@@ -152,7 +146,11 @@ fn collect_rc(
                 format!("{prefix}_{}", r.name)
             };
 
-            let field_name = heck::AsSnakeCase(&full_name).to_string();
+            let mut field_name = heck::AsSnakeCase(&full_name).to_string();
+            if crate::ident::ident(&field_name).to_string() != field_name {
+                // normalize to the final safe form (e.g. continue -> continue_)
+                field_name = crate::ident::ident(&field_name).to_string();
+            }
 
             out.push(RegItemIr {
                 name: full_name,

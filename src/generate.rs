@@ -3,12 +3,15 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use std::{fs, path::Path};
 
-use crate::svd_ir::{DeviceIr, GroupIr, RegKindIr};
+use crate::{
+    ident::{ident, snake_ident},
+    svd_ir::{DeviceIr, GroupIr, RegKindIr},
+};
 
-pub fn emit_crate(out_dir: &Path, crate_name: &str, no_std: bool, ir: &DeviceIr) -> Result<()> {
-    fs::create_dir_all(out_dir.join("src"))?;
+pub fn emit_crate(out_dir: &Path, ir: &DeviceIr) -> Result<()> {
+    fs::create_dir_all(out_dir)?;
 
-    emit_lib_rs(out_dir, no_std, ir)?;
+    emit_lib_rs(out_dir, ir)?;
     for g in &ir.groups {
         emit_group_module(out_dir, g)?;
     }
@@ -16,24 +19,22 @@ pub fn emit_crate(out_dir: &Path, crate_name: &str, no_std: bool, ir: &DeviceIr)
     Ok(())
 }
 
-fn emit_lib_rs(out_dir: &Path, no_std: bool, ir: &DeviceIr) -> Result<()> {
+fn emit_lib_rs(out_dir: &Path, ir: &DeviceIr) -> Result<()> {
     let mods = ir.groups.iter().map(|g| {
         let m = syn::Ident::new(&g.module_name, proc_macro2::Span::call_site());
         quote!(pub mod #m;)
     });
 
-    let top = if no_std { quote!(#![no_std]) } else { quote!() };
-
     let file = quote! {
-        #top
+        #![no_std]
         #(#mods)*
     };
 
-    write_rust_file(out_dir.join("src").join("lib.rs"), file)
+    write_rust_file(out_dir.join("lib.rs"), file)
 }
 
 fn emit_group_module(out_dir: &Path, g: &GroupIr) -> Result<()> {
-    let mod_path = out_dir.join("src").join(format!("{}.rs", g.module_name));
+    let mod_path = out_dir.join(format!("{}.rs", g.module_name));
 
     // Register field structs (bitpiece) + register block struct + instance constants.
     let reg_structs = g.items.iter().filter_map(|it| match &it.kind {
@@ -114,7 +115,7 @@ fn gen_register_type(
             pad_i += 1;
         }
 
-        let field_ident = format_ident!("{}", heck::AsSnakeCase(&name).to_string());
+        let field_ident = snake_ident(&name);
         let field_ty = format_ident!("B{}", w);
 
         if let Some(d) = doc {
@@ -163,7 +164,7 @@ fn gen_regs_block_struct(g: &GroupIr) -> TokenStream {
             cur = off;
         }
 
-        let field_ident = format_ident!("{}", it.field_name);
+        let field_ident = ident(&it.field_name);
         let doc_attr = it.description.as_ref().map(|d| quote!(#[doc = #d]));
 
         let (field_ty, size_bytes) = match &it.kind {
@@ -174,11 +175,11 @@ fn gen_regs_block_struct(g: &GroupIr) -> TokenStream {
                 // If we generated a bitpiece type (has fields and <=64 bits), use it, else primitive.
                 let has_fields = reg.fields.as_ref().map(|v| !v.is_empty()).unwrap_or(false);
                 if has_fields && size_bits <= 64 {
-                    let ty_name = format_ident!(
+                    let ty_name = ident(format!(
                         "{}{}Reg",
-                        regs_ty.to_string().trim_end_matches("Regs"),
-                        pascal(&it.name)
-                    );
+                        g.regs_ty.to_string().trim_end_matches("Regs"),
+                        heck::AsUpperCamelCase(&it.name)
+                    ));
                     (quote!(#ty_name), size_bytes)
                 } else {
                     let prim = storage_ty(size_bits);

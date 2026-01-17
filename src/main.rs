@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 mod generate;
+mod ident;
 mod name;
 mod svd_ir;
 
@@ -17,14 +18,6 @@ struct Args {
     /// Output directory for the generated PAC crate
     #[arg(long)]
     out: PathBuf,
-
-    /// Name for the generated crate (Cargo.toml)
-    #[arg(long, default_value = "device-pac")]
-    crate_name: String,
-
-    /// Generate #![no_std] in the output crate
-    #[arg(long, default_value_t = true)]
-    no_std: bool,
 }
 
 fn main() -> Result<()> {
@@ -41,7 +34,7 @@ fn main() -> Result<()> {
     let ir = svd_ir::build_device_ir(&dev)?;
 
     // 3) Emit crate: Cargo.toml, lib.rs, and one module per group
-    generate::emit_crate(&args.out, &args.crate_name, args.no_std, &ir)?;
+    generate::emit_crate(&args.out, &ir)?;
 
     eprintln!("Generated crate at: {}", args.out.display());
     Ok(())
