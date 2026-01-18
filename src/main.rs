@@ -595,6 +595,8 @@ fn mk_groups(device: &Device) -> Result<Vec<Group<'_>>> {
                                 group.desc
                             );
                         }
+
+                        group.peripherals.push(peripheral);
                     }
                     std::collections::hash_map::Entry::Vacant(vacant_entry) => {
                         vacant_entry.insert(Group::new(group_name, peripheral));
