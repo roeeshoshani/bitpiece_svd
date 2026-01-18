@@ -326,6 +326,15 @@ impl GeneratedFile {
 
 fn write_generated_files<I: Iterator<Item = GeneratedFile>>(files: I) -> Result<()> {
     for file in files {
+        if let Some(parent) = file.path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create parent {} of file {}",
+                    parent.display(),
+                    file.path.display()
+                )
+            })?
+        }
         let formatted_code = prettyplease::unparse(&file.code);
         std::fs::write(&file.path, formatted_code)
             .with_context(|| format!("failed to write to file {}", file.path.display()))?;
