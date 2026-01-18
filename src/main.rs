@@ -314,7 +314,12 @@ impl GeneratedFile {
     fn new(path: PathBuf, code: proc_macro2::TokenStream) -> Result<Self> {
         Ok(Self {
             path,
-            code: syn::parse2(code).context("failed to parse generated code into a valid ast")?,
+            code: syn::parse2(code.clone()).with_context(|| {
+                format!(
+                    "failed to parse generated code into a valid ast:\n{}\n",
+                    code.to_string(),
+                )
+            })?,
         })
     }
 }
