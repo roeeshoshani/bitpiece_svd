@@ -212,7 +212,10 @@ fn mk_b_type(bit_len: BitUnits) -> Result<syn::Ident> {
     if bit_len.0 < 1 || bit_len.0 > 64 {
         bail!("invalid bit length {} for bit field", bit_len);
     }
-    Ok(mk_ident(&format!("B{}", bit_len)))
+    match bit_len.0 {
+        8 | 16 | 32 | 64 => Ok(mk_ident(&format!("u{}", bit_len.0))),
+        _ => Ok(mk_ident(&format!("B{}", bit_len))),
+    }
 }
 
 struct EmittedRegFieldTy {
