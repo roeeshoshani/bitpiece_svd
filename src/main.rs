@@ -613,7 +613,10 @@ fn mk_groups(device: &Device) -> Result<Vec<Group<'_>>> {
             }
         }
     }
-    Ok(groups_by_name.into_values().collect())
+
+    let mut groups: Vec<Group> = groups_by_name.into_values().collect();
+    groups.sort_unstable_by_key(|group| group.name);
+    Ok(groups)
 }
 
 fn run() -> Result<()> {
