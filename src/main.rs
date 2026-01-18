@@ -13,6 +13,7 @@ use num_traits::Zero;
 use quote::{ToTokens, quote};
 use serde::{Deserialize, Deserializer};
 use sorted_vec::SortedVec;
+use svd_parser::svd::{Device, PeripheralInfo, RegisterCluster};
 
 #[derive(clap::Parser)]
 pub struct Cli {
@@ -198,7 +199,7 @@ impl<'a> RegsMemMap<'a> {
         let mut res = Self::new();
         for reg in regs {
             res.add_reg(reg)
-                .context(format!("failed to process register {}", reg.name))?;
+                .with_context(|| format!("failed to process register {}", reg.name))?;
         }
         Ok(res)
     }
@@ -368,24 +369,100 @@ fn write_generated_files<I: Iterator<Item = GeneratedFile>>(files: I) -> Result<
     for file in files {
         let formatted_code = prettyplease::unparse(&file.code);
         std::fs::write(&file.path, formatted_code)
-            .context(format!("failed to write to file {}", file.path.display()))?;
+            .with_context(|| format!("failed to write to file {}", file.path.display()))?;
     }
     Ok(())
 }
 
+#[derive(Debug, Default)]
+struct Group<'a> {
+    name: &'a str,
+    regs: Option<&'a Vec<RegisterCluster>>,
+    peripherals: Vec<&'a PeripheralInfo>,
+}
+impl<'a> Group<'a> {
+    fn new(name: &'a str, first_peripheral: &'a PeripheralInfo) -> Self {
+        Self {
+            name,
+            regs: first_peripheral.registers.as_ref(),
+            peripherals: vec![first_peripheral],
+        }
+    }
+}
+
+fn maybe_array_as_single<T>(x: &svd_parser::svd::MaybeArray<T>) -> &T {
+    match x {
+        svd_parser::svd::MaybeArray::Single(single) => single,
+        svd_parser::svd::MaybeArray::Array(_, _) => panic!("got an svd array after expansion"),
+    }
+}
+
+fn mk_groups(device: &Device) -> Result<Vec<Group<'_>>> {
+    let mut groups_by_name: HashMap<&str, Group<'_>> = HashMap::new();
+    for peripheral in &device.peripherals {
+        let peripheral = maybe_array_as_single(peripheral);
+        match &peripheral.group_name {
+            Some(group_name) => {
+                let group_entry = groups_by_name.entry(group_name.as_str());
+                match group_entry {
+                    std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
+                        let group = occupied_entry.get_mut();
+                        // make sure that this peripheral has the same register structure as all other peripherals in the group
+                        if group.regs != peripheral.registers.as_ref() {
+                            bail!(
+                                "peripherals {} and {} are in the same group but have a different register structure",
+                                peripheral.name,
+                                group.peripherals[0].name
+                            );
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                        vacant_entry.insert(Group::new(group_name, peripheral));
+                    }
+                }
+            }
+            None => {
+                let group_name = &peripheral.name;
+                let prev_group =
+                    groups_by_name.insert(group_name, Group::new(group_name, peripheral));
+                if let Some(prev_group) = prev_group {
+                    bail!("multiple groups named {}", prev_group.name)
+                }
+            }
+        }
+    }
+    Ok(groups_by_name.into_values().collect())
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let svd = std::fs::read_to_string(cli.svd_file).context("failed to read input svd file")?;
-    let device: SvdDevice = quick_xml::de::from_str(&svd).context("failed to parse svd file")?;
+
+    let svd_raw_xml =
+        std::fs::read_to_string(cli.svd_file).context("failed to read input svd file")?;
+    let device = svd_parser::parse_with_config(
+        &svd_raw_xml,
+        &svd_parser::Config::default()
+            .validate_level(svd_parser::ValidateLevel::Strict)
+            .expand_properties(true)
+            .expand(true),
+    )
+    .context("failed to parse svd file")?;
+
+    let groups = mk_groups(&device).context("failed to divide peripherals into groups")?;
+
+    let device: SvdDevice =
+        quick_xml::de::from_str(&svd_raw_xml).context("failed to parse svd file")?;
     let peripherals = Peripherals::from_svd(&device.peripherals);
     let peripheral_mods = peripherals
         .names()
         .map(|peripheral_name| {
             let raw_code = peripherals.emit_one(peripheral_name)?;
-            let mod_file_code = syn::parse2(raw_code).context(format!(
-                "failed to parse generated code of peripheral {} into a valid ast",
-                peripheral_name
-            ))?;
+            let mod_file_code = syn::parse2(raw_code).with_context(|| {
+                format!(
+                    "failed to parse generated code of peripheral {} into a valid ast",
+                    peripheral_name
+                )
+            })?;
             Ok(PeripheralGeneratedMod {
                 mod_ident: mk_peripheral_mod_ident(peripheral_name)?,
                 mod_file_path: cli
