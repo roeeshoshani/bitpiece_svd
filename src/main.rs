@@ -271,7 +271,7 @@ fn emit_reg_field_ty(group_name: &str, reg_entry: &RegMemMapEntry) -> Result<Emi
 
         let field_name = mk_ident(&field.name.to_snake_case());
         let field_ty = mk_b_type(field_bit_width)?;
-        let desc = &field.description;
+        let desc = resolve_opt_string(&field.description);
         struct_fields_code.extend(quote! {
             #[doc = #desc]
             pub #field_name: #field_ty,
@@ -508,7 +508,7 @@ impl<'a> Group<'a> {
             reg_field_types_code.extend(emitted_reg_field_ty.emitted_code);
 
             let field_ty = &emitted_reg_field_ty.reg_field_ty_ident;
-            let desc = &entry.reg.description;
+            let desc = resolve_opt_string(&entry.reg.description);
             struct_fields_code.extend(quote! {
                 #[doc = #desc]
                 pub #field_name: #field_ty,
