@@ -456,6 +456,8 @@ impl<'a> Group<'a> {
             .map(|peripheral| {
                 let peripheral_regs_const_ident =
                     mk_ident(&format!("{}_REGS", peripheral.name.to_shouty_snake_case()));
+                let peripheral_regs_addr_const_ident =
+                    mk_ident(&format!("{}_REGS_ADDR", peripheral.name.to_shouty_snake_case()));
 
                 let base_addr_hex = syn::LitInt::new(
                     &format!("0x{:x}", peripheral.base_address),
@@ -463,10 +465,11 @@ impl<'a> Group<'a> {
                 );
 
                 Ok(quote! {
+                    pub const #peripheral_regs_addr_const_ident: usize = #base_addr_hex;
                     pub const #peripheral_regs_const_ident: ::volatile::VolatilePtr<'static, #regs_struct_ident> = unsafe {
                         ::volatile::VolatilePtr::new_restricted(
                             ::volatile::access::ReadWrite,
-                            ::core::ptr::NonNull::new(#base_addr_hex as *mut #regs_struct_ident).unwrap(),
+                            ::core::ptr::NonNull::new(#peripheral_regs_addr_const_ident as *mut #regs_struct_ident).unwrap(),
                         )
                     };
                 })
